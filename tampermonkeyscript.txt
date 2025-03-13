@@ -1,0 +1,548 @@
+// ==UserScript==
+// @name         Snapinst Image Downloader (Full Resolution)
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Downloads full resolution Snapinst images with original filenames using keyboard shortcuts
+// @author       Claude
+// @match        https://snapinst.app/*
+// @match        https://*.snapinst.app/*
+// @grant        GM_registerMenuCommand
+// @grant        GM_download
+// @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Register a Tampermonkey menu command
+    GM_registerMenuCommand("Download All Snapinst Images (Full Resolution)", downloadAllImages);
+
+    // Create floating progress bar
+    function createProgressBar() {
+        // Remove existing progress bar if any
+        removeProgressBar();
+
+        // Create container
+        const container = document.createElement('div');
+        container.id = 'snapinst-progress-container';
+        container.style.cssText = `
+        position: fixed;
+        top: 40px;
+        left: 20px;
+        background-color: #fff;
+        border: 1px solid #ccc;
+        border-radius: 5px;
+        padding: 10px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        z-index: 9999;
+        width: 300px;
+       font-family: Arial, sans-serif;
+       `;
+
+        // Create title
+        const title = document.createElement('div');
+        title.textContent = 'Snapinst Downloader';
+        title.style.cssText = `
+            font-weight: bold;
+            margin-bottom: 10px;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+        `;
+
+        // Create close button
+        const closeBtn = document.createElement('span');
+        closeBtn.textContent = '✕';
+        closeBtn.style.cssText = `
+            cursor: pointer;
+            color: #777;
+        `;
+        closeBtn.onclick = removeProgressBar;
+        title.appendChild(closeBtn);
+
+        // Create progress text
+        const progressText = document.createElement('div');
+        progressText.id = 'snapinst-progress-text';
+        progressText.textContent = 'Preparing...';
+        progressText.style.cssText = `
+            margin-bottom: 5px;
+            font-size: 12px;
+        `;
+
+        // Create progress bar
+        const progressBarContainer = document.createElement('div');
+        progressBarContainer.style.cssText = `
+            background-color: #eee;
+            border-radius: 3px;
+            height: 10px;
+        `;
+
+        const progressBarFill = document.createElement('div');
+        progressBarFill.id = 'snapinst-progress-bar';
+        progressBarFill.style.cssText = `
+            background-color: #4CAF50;
+            height: 100%;
+            width: 0%;
+            border-radius: 3px;
+            transition: width 0.3s;
+        `;
+
+        progressBarContainer.appendChild(progressBarFill);
+
+        // Assemble progress bar
+        container.appendChild(title);
+        container.appendChild(progressText);
+        container.appendChild(progressBarContainer);
+
+        // Add to page
+        document.body.appendChild(container);
+
+        return container;
+    }
+
+    // Update progress bar
+    function updateProgressBar(current, total) {
+        const progressText = document.getElementById('snapinst-progress-text');
+        const progressBar = document.getElementById('snapinst-progress-bar');
+
+        if (progressText && progressBar) {
+            const percentage = Math.round((current / total) * 100);
+            progressText.textContent = `Downloading ${current} of ${total} images (${percentage}%)`;
+            progressBar.style.width = `${percentage}%`;
+        }
+    }
+
+    // Remove progress bar
+    function removeProgressBar() {
+        const container = document.getElementById('snapinst-progress-container');
+        if (container) {
+            container.remove();
+        }
+    }
+
+    // Function to find all matching images
+    function findSnapinstImages() {
+        const allImages = document.querySelectorAll('img');
+        const snapinstImages = [];
+
+        for (let img of allImages) {
+            const src = img.src || '';
+            if (src.startsWith('https://d.rapidcdn.app/snapinst?token=')) {
+                // Check if this is an image (not mp4/video)
+                if (!isVideoContent(src)) {
+                    // Find download/full resolution links
+                    const downloadLink = findFullResolutionLink(img);
+
+                    if (downloadLink && !isVideoContent(downloadLink)) {
+                        // Found a specific download link
+                        snapinstImages.push({
+                            thumbSrc: src,
+                            downloadSrc: downloadLink
+                        });
+                    } else if (!downloadLink) {
+                        // Modify the thumbnail URL to get full resolution
+                        snapinstImages.push({
+                            thumbSrc: src,
+                            downloadSrc: convertToFullResolution(src)
+                        });
+                    }
+                }
+            }
+        }
+
+        // Remove duplicates
+        return snapinstImages.filter((item, index, self) =>
+            index === self.findIndex((t) => t.thumbSrc === item.thumbSrc)
+        );
+    }
+
+    // Function to check if URL is likely a video
+    function isVideoContent(url) {
+        // Check URL for video indicators
+        if (url.includes('mp4') || url.includes('video') || url.includes('mov') ||
+            url.includes('webm') || url.includes('avi')) {
+            return true;
+        }
+
+        // Try to decode JWT token if present
+        try {
+            const tokenMatch = url.match(/token=([^&]+)/);
+            if (tokenMatch && tokenMatch[1]) {
+                const parts = tokenMatch[1].split('.');
+                if (parts.length === 3) {
+                    const payloadStr = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
+                    const payload = JSON.parse(payloadStr);
+
+                    // Check filename or URL in payload
+                    if ((payload.filename && /\.(mp4|mov|webm|avi)$/i.test(payload.filename)) ||
+                        (payload.url && /\.(mp4|mov|webm|avi)$/i.test(payload.url))) {
+                        return true;
+                    }
+
+                    // Check content type if available
+                    if (payload.contentType && payload.contentType.startsWith('video/')) {
+                        return true;
+                    }
+                }
+            }
+        } catch (e) {
+            console.error("Error checking content type:", e);
+        }
+
+        return false;
+    }
+
+    // Function to find full resolution download links
+    function findFullResolutionLink(imgElement) {
+        // First, look for parent anchors or buttons that may contain the full-res link
+        let parent = imgElement.parentElement;
+        const maxDepth = 4; // Don't go too deep in the DOM
+        let depth = 0;
+
+        while (parent && depth < maxDepth) {
+            // Check if this element or its children have download attributes/links
+            const downloadLinks = parent.querySelectorAll('a[download], a[href*="dl=1"], a[href*="1080"], button[data-url], [data-download-url]');
+
+            for (let link of downloadLinks) {
+                let url = link.href || link.getAttribute('data-url') || link.getAttribute('data-download-url');
+                if (url && url.includes('d.rapidcdn.app/snapinst?token=') && !isVideoContent(url)) {
+                    return url;
+                }
+            }
+
+            // Move up the DOM tree
+            parent = parent.parentElement;
+            depth++;
+        }
+
+        return null;
+    }
+
+    // Function to convert thumbnail URL to full resolution URL
+    function convertToFullResolution(url) {
+        try {
+            // Base modifications for all URLs
+            let fullResUrl = url;
+
+            // Add download parameter
+            if (!fullResUrl.includes('dl=1')) {
+                fullResUrl += (fullResUrl.includes('?') ? '&' : '?') + 'dl=1';
+            }
+
+            // Try to decode the token to modify resolution parameters
+            const tokenMatch = url.match(/token=([^&]+)/);
+            if (tokenMatch && tokenMatch[1]) {
+                try {
+                    // Split the token (JWT format: header.payload.signature)
+                    const parts = tokenMatch[1].split('.');
+                    if (parts.length === 3) {
+                        // Decode the payload
+                        const payloadStr = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
+                        const payload = JSON.parse(payloadStr);
+
+                        if (payload.url) {
+                            // Replace p640x640 with p1080x1080
+                            if (payload.url.includes('p640x640')) {
+                                const newUrl = payload.url.replace('p640x640', 'p1080x1080');
+                                payload.url = newUrl;
+
+                                // Update filename if it exists
+                                if (payload.filename && payload.filename.includes('thumb')) {
+                                    payload.filename = payload.filename.replace('thumb_', '').replace('.jpg', '_1080.jpg');
+                                }
+
+                                // We cannot recreate the full JWT since we don't have the secret key
+                                // But we can extract the download URL from the page instead
+
+                                // Check if there are any download links on the page with 1080 resolution
+                                const downloadLinks = document.querySelectorAll('a[href*="1080"][href*="d.rapidcdn.app/snapinst?token="]');
+                                for (let link of downloadLinks) {
+                                    if (link.href.includes(tokenMatch[1].substring(0, 20)) && !isVideoContent(link.href)) {
+                                        return link.href;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error("Error decoding token:", e);
+                }
+            }
+
+            return fullResUrl;
+        } catch (e) {
+            console.error("Error converting to full resolution:", e);
+            return url;
+        }
+    }
+
+    // Function to extract filename from URL or token
+    function getOriginalFilename(url) {
+        // Try to decode the token to get the filename
+        try {
+            const tokenMatch = url.match(/token=([^&]+)/);
+            if (tokenMatch && tokenMatch[1]) {
+                // Split the token (JWT format: header.payload.signature)
+                const parts = tokenMatch[1].split('.');
+                if (parts.length === 3) {
+                    // Decode the payload
+                    const payloadStr = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
+                    const payload = JSON.parse(payloadStr);
+
+                    if (payload.filename) {
+                        // Get clear filename without prefix
+                        let filename = payload.filename;
+                        if (filename.startsWith('Snapinst.app_')) {
+                            filename = filename.substring('Snapinst.app_'.length);
+                        }
+                        // Ensure 1080 version
+                        if (!filename.includes('1080')) {
+                            filename = filename.replace('.jpg', '_1080.jpg');
+                        }
+                        return filename;
+                    }
+                }
+            }
+        } catch (e) {
+            console.error("Error parsing token for filename:", e);
+        }
+
+        // Extract from URL
+        try {
+            const urlObj = new URL(url);
+            const pathParts = urlObj.pathname.split('/');
+            const lastPart = pathParts[pathParts.length - 1];
+            if (lastPart && lastPart.includes('.')) {
+                return lastPart;
+            }
+        } catch (e) {
+            console.error("Error parsing URL for filename:", e);
+        }
+
+        // Fallback: Create filename from URL hash
+        return `snapinst_${Date.now()}_1080.jpg`;
+    }
+
+    // Function to sanitize filename
+    function sanitizeFilename(filename) {
+        // Remove invalid characters
+        let sanitized = filename.replace(/[\/\\:*?"<>|]/g, '_');
+
+        // Ensure it has a valid extension
+        if (!sanitized.match(/\.(jpg|jpeg|png|gif|webp)$/i)) {
+            sanitized += '.jpg';
+        }
+
+        return sanitized;
+    }
+
+    // Function to get HTML elements that store high-res link information
+    function extractFullResLinks() {
+        // Some sites store image data in JSON inside script tags
+        try {
+            // Look for script tags with image data
+            const scripts = document.querySelectorAll('script:not([src])');
+            const links = [];
+
+            for (let script of scripts) {
+                const content = script.textContent;
+                if (!content) continue;
+
+                // Look for JSON data with image URLs
+                if (content.includes('d.rapidcdn.app/snapinst?token=') && content.includes('1080')) {
+                    // Extract all URLs
+                    const urlRegex = /(https:\/\/d\.rapidcdn\.app\/snapinst\?token=[^"']+)/g;
+                    let match;
+                    while ((match = urlRegex.exec(content)) !== null) {
+                        if (match[1].includes('1080') && !isVideoContent(match[1])) {
+                            links.push(match[1]);
+                        }
+                    }
+                }
+            }
+
+            return links;
+        } catch (e) {
+            console.error("Error extracting full res links:", e);
+            return [];
+        }
+    }
+
+    // Function to find all download links on the page
+    function findDownloadLinks() {
+        // Find all download links that might contain full-res images
+        const downloadLinks = Array.from(document.querySelectorAll('a[href*="d.rapidcdn.app/snapinst?token="]'));
+        return downloadLinks
+            .filter(link => (link.href.includes('dl=1') || link.href.includes('1080')) && !isVideoContent(link.href))
+            .map(link => link.href);
+    }
+
+    // Function to handle the download process
+    function downloadAllImages() {
+        // Create and show progress bar
+        createProgressBar();
+        updateProgressBar(0, 1); // Initial state
+
+        // First try to get all full-res download links directly
+        let fullResLinks = findDownloadLinks();
+
+        // Supplement with embedded links in scripts
+        fullResLinks = [...fullResLinks, ...extractFullResLinks()];
+
+        let imageObjects = [];
+
+        if (fullResLinks.length > 0) {
+            // Use the direct links if found
+            imageObjects = fullResLinks.map(url => ({
+                thumbSrc: url, // Use the same URL for both since we already have the full-res
+                downloadSrc: url.includes('dl=1') ? url : url + (url.includes('?') ? '&' : '?') + 'dl=1'
+            }));
+        } else {
+            // Fallback to finding images and converting them
+            imageObjects = findSnapinstImages();
+        }
+
+        if (imageObjects.length === 0) {
+            updateProgressBar(0, 0);
+            document.getElementById('snapinst-progress-text').textContent = 'No Snapinst images found on this page.';
+
+            setTimeout(() => {
+                removeProgressBar();
+            }, 3000);
+
+            alert("No Snapinst images found on this page.");
+            return;
+        }
+
+        // Notification
+        GM_notification({
+            text: `Found ${imageObjects.length} images. Starting download...`,
+            title: "Snapinst Downloader",
+            timeout: 5000
+        });
+
+        // Update progress bar
+        updateProgressBar(0, imageObjects.length);
+
+        // Process downloads sequentially
+        downloadSequentially(imageObjects, 0);
+    }
+
+    // Function to download a single image
+    function downloadImage(url, filename, index, total, onComplete) {
+        GM_download({
+            url: url,
+            name: filename,
+            onload: function() {
+                console.log(`Downloaded ${index}/${total}: ${filename}`);
+                onComplete(true);
+            },
+            onerror: function(error) {
+                console.error(`Failed to download ${filename}:`, error);
+
+                // Try alternate method
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: url,
+                    responseType: "blob",
+                    headers: {
+                        "Referer": "https://snapinst.app/",
+                        "User-Agent": navigator.userAgent
+                    },
+                    onload: function(response) {
+                        if (response.status === 200) {
+                            const blob = response.response;
+                            const blobUrl = URL.createObjectURL(blob);
+
+                            // Create a temporary download link
+                            const a = document.createElement('a');
+                            a.href = blobUrl;
+                            a.download = filename;
+                            a.style.display = 'none';
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+
+                            // Clean up
+                            setTimeout(() => URL.revokeObjectURL(blobUrl), 100);
+
+                            console.log(`Downloaded (alt method) ${index}/${total}: ${filename}`);
+                            onComplete(true);
+                        } else {
+                            console.error(`HTTP error ${response.status} for ${filename}`);
+                            onComplete(false);
+                        }
+                    },
+                    onerror: function() {
+                        console.error(`Failed to download ${filename} with both methods`);
+                        onComplete(false);
+                    }
+                });
+            }
+        });
+    }
+
+    // Function to download images one at a time
+    function downloadSequentially(imageObjects, index) {
+        if (index >= imageObjects.length) {
+            // All downloads complete
+            updateProgressBar(imageObjects.length, imageObjects.length);
+            document.getElementById('snapinst-progress-text').textContent = `Successfully downloaded ${imageObjects.length} images.`;
+
+            GM_notification({
+                text: `Successfully downloaded ${imageObjects.length} images.`,
+                title: "Snapinst Downloader",
+                timeout: 5000
+            });
+
+            // Remove progress bar after 5 seconds
+            setTimeout(() => {
+                removeProgressBar();
+            }, 5000);
+
+            return;
+        }
+
+        const imageObj = imageObjects[index];
+        const originalFilename = getOriginalFilename(imageObj.downloadSrc);
+        const safeFilename = sanitizeFilename(originalFilename);
+
+        // Add index to filename to prevent duplicates
+        const finalFilename = `${index+1}_${safeFilename}`;
+
+        // Add dl=1 parameter if not present
+        let finalUrl = imageObj.downloadSrc;
+        if (!finalUrl.includes('dl=1')) {
+            finalUrl += (finalUrl.includes('?') ? '&' : '?') + 'dl=1';
+        }
+
+        // Update progress bar
+        updateProgressBar(index, imageObjects.length);
+
+        // Download the image
+        downloadImage(finalUrl, finalFilename, index+1, imageObjects.length, function(success) {
+            // Continue with next image after a short delay
+            setTimeout(() => {
+                downloadSequentially(imageObjects, index + 1);
+            }, 300);
+        });
+    }
+
+    // Add keyboard shortcut listeners
+    document.addEventListener('keydown', function(e) {
+        // Check for Ctrl+Z (Windows/Linux) or Z key
+        if ((e.ctrlKey && e.key === 'z') || (!e.ctrlKey && !e.altKey && !e.shiftKey && e.key === 'z' || e.key === 'Z')) {
+            console.log('Keyboard shortcut detected: Starting download');
+            downloadAllImages();
+
+            // Prevent default browser behavior (undo)
+            if (e.ctrlKey) {
+                e.preventDefault();
+            }
+        }
+    });
+
+    // Log that the script is active
+    console.log("Snapinst Image Downloader (Full Resolution) is active - Press Ctrl+Z or Z to download all images");
+})();
