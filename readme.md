@@ -1,0 +1,1 @@
+https://snapinst.app/
